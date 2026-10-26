@@ -786,7 +786,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fd-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "memchr",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "forza-designer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "fd-core",
