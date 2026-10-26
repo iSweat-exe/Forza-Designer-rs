@@ -121,13 +121,6 @@ impl BBox {
     }
 }
 
-/// Reusable rasterisation buffer: `data[(y - y0) * width + (x - x0)]`.
-#[derive(Debug, Default)]
-pub struct Mask {
-    pub bbox: BBox,
-    pub data: Vec<bool>,
-}
-
 fn clip_bbox(x0: f32, y0: f32, x1: f32, y1: f32, w: usize, h: usize) -> BBox {
     let cx0 = x0.floor().max(0.0) as usize;
     let cy0 = y0.floor().max(0.0) as usize;
@@ -258,85 +251,6 @@ impl Shape {
                 clip_bbox(x - r, y - r, x + r + 1.0, y + r + 1.0, w, h)
             }
         }
-    }
-
-    /// Rasterise into `mask` (binary coverage, pixel centres on the integer grid
-    /// like the original). Returns `false` when the shape covers no pixel.
-    pub fn rasterize(&self, w: usize, h: usize, mask: &mut Mask) -> bool {
-        let bbox = self.bbox(w, h);
-        mask.bbox = bbox;
-        mask.data.clear();
-        if bbox.is_empty() {
-            return false;
-        }
-        mask.data.reserve(bbox.width() * bbox.height());
-        let rows = bbox.y0..bbox.y1;
-        let cols = || bbox.x0..bbox.x1;
-        match *self {
-            Self::Ellipse { x, y, rx, ry, .. } => {
-                let (irx, iry) = (1.0 / rx.max(1e-6), 1.0 / ry.max(1e-6));
-                for py in rows {
-                    let dy = (py as f32 - y) * iry;
-                    mask.data.extend(cols().map(|px| {
-                        let dx = (px as f32 - x) * irx;
-                        dx * dx + dy * dy <= 1.0
-                    }));
-                }
-            }
-            Self::Circle { x, y, r, .. } => {
-                let r2 = r.max(1e-6).powi(2);
-                for py in rows {
-                    let dy = py as f32 - y;
-                    mask.data.extend(cols().map(|px| {
-                        let dx = px as f32 - x;
-                        dx * dx + dy * dy <= r2
-                    }));
-                }
-            }
-            Self::Rectangle { .. } => {
-                mask.data.resize(bbox.width() * bbox.height(), true);
-            }
-            Self::RotatedEllipse {
-                x,
-                y,
-                rx,
-                ry,
-                angle,
-                ..
-            } => {
-                let (sin_a, cos_a) = angle.to_radians().sin_cos();
-                let (irx, iry) = (1.0 / rx.max(1e-6), 1.0 / ry.max(1e-6));
-                for py in rows {
-                    let yg = py as f32 - y;
-                    mask.data.extend(cols().map(|px| {
-                        let xg = px as f32 - x;
-                        let xr = (cos_a * xg + sin_a * yg) * irx;
-                        let yr = (-sin_a * xg + cos_a * yg) * iry;
-                        xr * xr + yr * yr <= 1.0
-                    }));
-                }
-            }
-            Self::RotatedRectangle {
-                x,
-                y,
-                hw,
-                hh,
-                angle,
-                ..
-            } => {
-                let (sin_a, cos_a) = angle.to_radians().sin_cos();
-                for py in rows {
-                    let yg = py as f32 - y;
-                    mask.data.extend(cols().map(|px| {
-                        let xg = px as f32 - x;
-                        let xr = cos_a * xg + sin_a * yg;
-                        let yr = -sin_a * xg + cos_a * yg;
-                        xr.abs() <= hw && yr.abs() <= hh
-                    }));
-                }
-            }
-        }
-        true
     }
 
     /// Random shape. `max_size_frac` caps the largest dimension as a fraction of
@@ -490,9 +404,12 @@ mod tests {
     use rand::SeedableRng;
 
     use super::*;
+    use crate::shapegen::raster::Spans;
 
-    fn count(mask: &Mask) -> usize {
-        mask.data.iter().filter(|&&b| b).count()
+    fn area(s: &Shape, w: usize, h: usize) -> usize {
+        let mut spans = Spans::default();
+        s.spans(w, h, &mut spans);
+        spans.area()
     }
 
     #[test]
@@ -503,9 +420,7 @@ mod tests {
             r: 20.0,
             color: [0; 4],
         };
-        let mut m = Mask::default();
-        assert!(s.rasterize(100, 100, &mut m));
-        let area = count(&m) as f32;
+        let area = area(&s, 100, 100) as f32;
         assert!((area - std::f32::consts::PI * 400.0).abs() < 30.0, "{area}");
     }
 
@@ -526,11 +441,7 @@ mod tests {
             angle: 0.0,
             color: [0; 4],
         };
-        let (mut ma, mut mb) = (Mask::default(), Mask::default());
-        a.rasterize(100, 100, &mut ma);
-        b.rasterize(100, 100, &mut mb);
-        // Rotated bbox is square so compare coverage, not layout.
-        assert_eq!(count(&ma), count(&mb));
+        assert_eq!(area(&a, 100, 100), area(&b, 100, 100));
     }
 
     #[test]
@@ -541,8 +452,7 @@ mod tests {
             r: 5.0,
             color: [0; 4],
         };
-        let mut m = Mask::default();
-        assert!(!s.rasterize(100, 100, &mut m));
+        assert!(!s.spans(100, 100, &mut Spans::default()));
     }
 
     #[test]

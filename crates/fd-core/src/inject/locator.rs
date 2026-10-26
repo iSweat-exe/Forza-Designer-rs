@@ -1,7 +1,7 @@
 //! Finding the live vinyl group (`CLiveryGroup`) in the game's memory.
 //!
 //! 1. **Sphere scan** (fast, primary): look in writable heap for a `u16`
-//!    equal to the layer count at `group + count_offset`, then require the layer
+//!    equal to a layer count at `group + count_offset`, then require the layer
 //!    table to look like a *fresh, untouched* template (every sampled layer
 //!    scores 5/5, and >= 85 % of the whole table does).
 //! 2. **RTTI scan** (slow, fallback): find the MSVC RTTI chain for the class
@@ -9,15 +9,20 @@
 //!    Identity is by C++ type, so already-painted templates are found too.
 //!
 //! Both are strict on purpose: writing through a wrong table corrupts the game.
+//!
+//! Performance: memory is read in chunks by several threads at once, and every
+//! plausible template size is searched in **one pass** over the heap (rather
+//! than one full pass per size). Candidate *validation* stays sequential and in
+//! address order, so results and early exit behave like a single-threaded scan.
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use super::layer::{loose_valid_layer, score_layer};
 use super::layout::GameProfile;
 use super::memory::{
-    is_user_ptr, read_exact, read_u32, read_u64, read_u8, scan_region, MemoryRegion, ProcessMemory,
-    RegionKind,
+    chunk_plan, find_owned, is_user_ptr, read_chunk, read_exact, read_u32, read_u64, read_u8,
+    scan_batches, ChunkSpec, MemoryRegion, ProcessMemory, RegionKind, ScanEnd,
 };
 use super::InjectError;
 
@@ -34,10 +39,17 @@ pub struct Located {
     pub table_addr: u64,
 }
 
+/// A located group together with its layer count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Found {
+    pub at: Located,
+    pub layers: usize,
+}
+
 /// What a scan reports while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanEvent {
-    /// Regions scanned so far, total regions, candidates so far.
+    /// Chunks scanned so far, total chunks, candidates examined so far.
     Progress {
         scanned: u32,
         total: u32,
@@ -46,19 +58,27 @@ pub enum ScanEvent {
     Phase(RttiPhase),
 }
 
+/// Phases of the RTTI scan, surfaced so the UI can explain the long wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RttiPhase {
+    ClassName,
+    TypeDescriptorRefs,
+    VtableRefs,
+    HeapScan,
+}
+
 fn read_table_ptr(mem: &dyn ProcessMemory, table_addr: u64, index: usize) -> u64 {
     read_u64(mem, table_addr + index as u64 * 8).unwrap_or(0)
 }
 
-fn count_strict(mem: &dyn ProcessMemory, profile: &GameProfile, table: u64, count: usize) -> usize {
+fn count_where(
+    mem: &dyn ProcessMemory,
+    table: u64,
+    count: usize,
+    ok: impl Fn(u64) -> bool,
+) -> usize {
     (0..count)
-        .filter(|&k| score_layer(mem, &profile.layout, read_table_ptr(mem, table, k)) >= 5)
-        .count()
-}
-
-fn count_loose(mem: &dyn ProcessMemory, profile: &GameProfile, table: u64, count: usize) -> usize {
-    (0..count)
-        .filter(|&k| loose_valid_layer(mem, &profile.layout, read_table_ptr(mem, table, k)))
+        .filter(|&k| ok(read_table_ptr(mem, table, k)))
         .count()
 }
 
@@ -80,104 +100,146 @@ fn heap_regions(mem: &dyn ProcessMemory, private_only: bool) -> Vec<MemoryRegion
     regions
 }
 
-/// Sphere-fingerprint scan for a group with exactly `count` layers.
+/// A possible group found while scanning, before any validation.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    at: Located,
+    /// Index into the list of wanted layer counts.
+    size_index: usize,
+}
+
+/// 64 Kibit membership set over `u16` values.
+struct CountSet(Box<[u64; 1024]>);
+
+impl CountSet {
+    fn new(counts: &[usize]) -> Self {
+        let mut bits = Box::new([0u64; 1024]);
+        for &c in counts {
+            if let Ok(v) = u16::try_from(c) {
+                bits[usize::from(v >> 6)] |= 1 << (v & 63);
+            }
+        }
+        Self(bits)
+    }
+
+    fn contains(&self, v: u16) -> bool {
+        self.0[usize::from(v >> 6)] >> (v & 63) & 1 == 1
+    }
+}
+
+/// Sphere-fingerprint scan for a fresh template whose layer count is any of
+/// `sizes`. `sizes` is in order of preference: a confirmed match for `sizes[0]`
+/// stops the scan immediately, otherwise the earliest-listed size that was
+/// confirmed by the end of the scan wins.
 pub fn locate_by_sphere_scan(
     mem: &dyn ProcessMemory,
     profile: &GameProfile,
-    count: usize,
+    sizes: &[usize],
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(ScanEvent),
-) -> Result<Option<Located>, InjectError> {
+) -> Result<Option<Found>, InjectError> {
     let layout = &profile.layout;
-    let needle = (count as u16).to_le_bytes();
-    let regions = heap_regions(mem, false);
-    let total = regions.len() as u32;
-    let mut plausible = 0usize;
-    let mut perfect: Vec<Located> = Vec::new();
-    let mut confirmed: Option<Located> = None;
-    let sample = count.min(SAMPLE_LAYERS);
+    let wanted = CountSet::new(sizes);
+    let chunks = chunk_plan(&heap_regions(mem, false), 1);
+    let total = chunks.len() as u32;
 
-    for (i, region) in regions.iter().enumerate() {
-        let flow = scan_region(mem, region, &needle, 1, cancel, |addr, chunk, pos| {
+    let worker = |spec: &ChunkSpec| -> Vec<Candidate> {
+        let Some(data) = read_chunk(mem, spec) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let last = data.len().saturating_sub(1).min(spec.own_len);
+        for pos in 0..last {
+            let v = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            if !wanted.contains(v) {
+                continue;
+            }
+            let addr = spec.addr + pos as u64;
             let Some(group_addr) = addr
                 .checked_sub(layout.count_offset)
-                .filter(|g| *g >= region.base)
+                .filter(|g| *g >= spec.region_base)
             else {
-                return ControlFlow::Continue(());
+                continue;
             };
             // Cheap pre-filter without a syscall: the table pointer is almost
             // always inside the chunk we already hold.
-            let tbl_pos =
-                (pos + layout.table_offset as usize).checked_sub(layout.count_offset as usize);
-            let table_addr = tbl_pos
-                .and_then(|p| chunk.get(p..p + 8))
+            let table_addr = (pos + layout.table_offset as usize)
+                .checked_sub(layout.count_offset as usize)
+                .and_then(|p| data.get(p..p + 8))
                 .and_then(|b| b.try_into().ok())
                 .map(u64::from_le_bytes)
                 .or_else(|| read_u64(mem, group_addr + layout.table_offset))
                 .unwrap_or(0);
-            if !is_user_ptr(table_addr) {
-                return ControlFlow::Continue(());
+            // The table is an array of pointers: it must be pointer-aligned.
+            if !is_user_ptr(table_addr) || table_addr % 8 != 0 {
+                continue;
             }
-            plausible += 1;
-            if plausible > MAX_CANDIDATES {
-                return ControlFlow::Break(());
+            if let Some(size_index) = sizes.iter().position(|&s| s == usize::from(v)) {
+                out.push(Candidate {
+                    at: Located {
+                        group_addr,
+                        table_addr,
+                    },
+                    size_index,
+                });
             }
-            let all_strict = (0..sample)
-                .all(|k| score_layer(mem, layout, read_table_ptr(mem, table_addr, k)) >= 5);
-            if !all_strict {
-                return ControlFlow::Continue(());
+        }
+        out
+    };
+
+    let mut confirmed: Vec<Option<Located>> = vec![None; sizes.len()];
+    let mut examined = 0usize;
+    let end = scan_batches(&chunks, cancel, worker, |candidates, done| {
+        let mut flow = ControlFlow::Continue(());
+        for c in candidates {
+            examined += 1;
+            if examined > MAX_CANDIDATES {
+                flow = ControlFlow::Break(());
+                break;
             }
-            let candidate = Located {
-                group_addr,
-                table_addr,
-            };
-            let valid = count_strict(mem, profile, table_addr, count);
-            if valid as f64 >= count as f64 * FULL_TABLE_THRESHOLD {
-                confirmed = Some(candidate); // first confident match wins; stop scanning
-                return ControlFlow::Break(());
+            if confirmed[c.size_index].is_some() {
+                continue;
             }
-            perfect.push(candidate);
-            ControlFlow::Continue(())
-        });
+            if validate_fresh(mem, profile, c.at.table_addr, sizes[c.size_index]) {
+                confirmed[c.size_index] = Some(c.at);
+                if c.size_index == 0 {
+                    flow = ControlFlow::Break(()); // the exact size: nothing can beat it
+                    break;
+                }
+            }
+        }
         on_event(ScanEvent::Progress {
-            scanned: i as u32 + 1,
+            scanned: done as u32,
             total,
-            hits: perfect.len() as u32 + u32::from(confirmed.is_some()),
+            hits: examined as u32,
         });
-        if cancel.load(Ordering::Relaxed) {
-            return Err(InjectError::Cancelled);
-        }
-        if flow.is_break() {
-            break;
-        }
+        flow
+    });
+    if end == ScanEnd::Cancelled {
+        return Err(InjectError::Cancelled);
     }
-    Ok(confirmed.or_else(|| best_by_full_table(mem, profile, perfect, count)))
+    Ok(confirmed
+        .iter()
+        .zip(sizes)
+        .find_map(|(at, &layers)| at.map(|at| Found { at, layers })))
 }
 
-/// Among candidates, the one whose whole table validates best (must clear the threshold).
-fn best_by_full_table(
+/// 16/16 sampled layers perfect, then >= 85 % of the whole table perfect.
+fn validate_fresh(
     mem: &dyn ProcessMemory,
     profile: &GameProfile,
-    c: Vec<Located>,
+    table: u64,
     count: usize,
-) -> Option<Located> {
-    c.into_iter()
-        .map(|l| (count_strict(mem, profile, l.table_addr, count), l))
-        .max_by_key(|(valid, _)| *valid)
-        .filter(|(valid, _)| *valid as f64 >= count as f64 * FULL_TABLE_THRESHOLD)
-        .map(|(_, l)| l)
+) -> bool {
+    let layout = &profile.layout;
+    let strict = |ptr: u64| score_layer(mem, layout, ptr) >= 5;
+    (0..count.min(SAMPLE_LAYERS)).all(|k| strict(read_table_ptr(mem, table, k)))
+        && count_where(mem, table, count, strict) as f64 >= count as f64 * FULL_TABLE_THRESHOLD
 }
 
-/// Phases of the RTTI scan, surfaced so the UI can explain the long wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RttiPhase {
-    ClassName,
-    TypeDescriptorRefs,
-    VtableRefs,
-    HeapScan,
-}
-
-/// All occurrences of `needle` inside readable image regions.
+/// All occurrences of `needle` in the game image's data (non-code) pages,
+/// ascending. Falls back to code pages too if the data pages have none (e.g. a
+/// packed executable).
 fn find_in_images(
     mem: &dyn ProcessMemory,
     needle: &[u8],
@@ -186,35 +248,56 @@ fn find_in_images(
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(ScanEvent),
 ) -> Result<Vec<u64>, InjectError> {
-    let regions: Vec<_> = mem
-        .regions()
-        .into_iter()
-        .filter(|r| r.kind == RegionKind::Image && r.readable)
-        .collect();
-    let total = regions.len().max(1) as u32;
-    let mut hits = Vec::new();
-    for (i, region) in regions.iter().enumerate() {
-        let flow = scan_region(mem, region, needle, align, cancel, |addr, _, _| {
-            hits.push(addr);
-            if stop_after.is_some_and(|n| hits.len() >= n) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        });
-        on_event(ScanEvent::Progress {
-            scanned: i as u32 + 1,
-            total,
-            hits: hits.len() as u32,
-        });
-        if cancel.load(Ordering::Relaxed) {
+    for include_code in [false, true] {
+        let regions: Vec<_> = mem
+            .regions()
+            .into_iter()
+            .filter(|r| {
+                r.kind == RegionKind::Image && r.readable && (include_code || !r.executable)
+            })
+            .collect();
+        if regions.is_empty() {
+            continue;
+        }
+        let chunks = chunk_plan(&regions, needle.len().saturating_sub(1));
+        let total = chunks.len() as u32;
+        let mut hits: Vec<u64> = Vec::new();
+        let end = scan_batches(
+            &chunks,
+            cancel,
+            |spec| {
+                read_chunk(mem, spec)
+                    .map(|d| {
+                        find_owned(spec, &d, needle, align)
+                            .into_iter()
+                            .map(|(a, _)| a)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+            |found: Vec<u64>, done| {
+                hits.extend(found);
+                on_event(ScanEvent::Progress {
+                    scanned: done as u32,
+                    total,
+                    hits: hits.len() as u32,
+                });
+                if stop_after.is_some_and(|n| hits.len() >= n) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        if end == ScanEnd::Cancelled {
             return Err(InjectError::Cancelled);
         }
-        if flow.is_break() {
-            break;
+        if !hits.is_empty() {
+            hits.sort_unstable();
+            return Ok(hits);
         }
     }
-    Ok(hits)
+    Ok(Vec::new())
 }
 
 /// MSVC RTTI walk: class-name string -> TypeDescriptor -> CompleteObjectLocator
@@ -265,96 +348,106 @@ fn find_vtables(
     Ok(vtables)
 }
 
-/// RTTI-based scan for a group with `count` layers. Accepts already-painted
-/// templates (loose layer check), requiring 95 % of layers to be sane.
+/// RTTI-based scan for a group with any of `sizes` layers (same preference
+/// rules as [`locate_by_sphere_scan`]). Accepts already-painted templates (loose
+/// layer check), requiring 95 % of layers to be sane.
 pub fn locate_by_rtti(
     mem: &dyn ProcessMemory,
     profile: &GameProfile,
-    count: usize,
+    sizes: &[usize],
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(ScanEvent),
-) -> Result<Option<Located>, InjectError> {
+) -> Result<Option<Found>, InjectError> {
     let layout = &profile.layout;
     let Some(module_base) = mem.main_module_base() else {
         return Ok(None);
     };
+    // The vtable chain is the same for every size: resolve it once.
     let vtables = find_vtables(mem, profile, module_base, cancel, on_event)?;
     if vtables.is_empty() {
         return Ok(None);
     }
 
     on_event(ScanEvent::Phase(RttiPhase::HeapScan));
-    let regions = heap_regions(mem, true);
-    let total = regions.len() as u32;
-    let mut candidates: Vec<Located> = Vec::new();
-    let mut confirmed: Option<Located> = None;
-    let sample = count.min(SAMPLE_LAYERS);
+    let chunks = chunk_plan(&heap_regions(mem, true), 7);
+    let total = chunks.len() as u32;
 
-    for (i, region) in regions.iter().enumerate() {
-        'vtables: for vtable in &vtables {
-            let flow = scan_region(
-                mem,
-                region,
-                &vtable.to_le_bytes(),
-                8,
-                cancel,
-                |group_addr, _, _| {
-                    let Some(raw) = read_u32(mem, group_addr + layout.count_offset) else {
-                        return ControlFlow::Continue(());
-                    };
-                    if (raw & 0xFFFF) as usize != count {
-                        return ControlFlow::Continue(());
-                    }
-                    let table_addr = read_u64(mem, group_addr + layout.table_offset).unwrap_or(0);
-                    if !is_user_ptr(table_addr)
-                        || candidates.iter().any(|c| c.group_addr == group_addr)
-                    {
-                        return ControlFlow::Continue(());
-                    }
-                    let candidate = Located {
-                        group_addr,
-                        table_addr,
-                    };
-                    let sampled_ok = (0..sample).all(|k| {
-                        loose_valid_layer(mem, layout, read_table_ptr(mem, table_addr, k))
+    let worker = |spec: &ChunkSpec| -> Vec<Candidate> {
+        let Some(data) = read_chunk(mem, spec) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for vtable in &vtables {
+            for (group_addr, pos) in find_owned(spec, &data, &vtable.to_le_bytes(), 8) {
+                let count_at = pos + layout.count_offset as usize;
+                let raw = data
+                    .get(count_at..count_at + 4)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .or_else(|| read_u32(mem, group_addr + layout.count_offset));
+                let Some(raw) = raw else { continue };
+                let Some(size_index) = sizes.iter().position(|&s| s == (raw & 0xFFFF) as usize)
+                else {
+                    continue;
+                };
+                let table_addr = read_u64(mem, group_addr + layout.table_offset).unwrap_or(0);
+                if is_user_ptr(table_addr) {
+                    out.push(Candidate {
+                        at: Located {
+                            group_addr,
+                            table_addr,
+                        },
+                        size_index,
                     });
-                    if sampled_ok
-                        && count_loose(mem, profile, table_addr, count) as f64
-                            >= count as f64 * RTTI_TABLE_THRESHOLD
-                    {
-                        confirmed = Some(candidate);
-                        return ControlFlow::Break(());
-                    }
-                    candidates.push(candidate);
-                    ControlFlow::Continue(())
-                },
-            );
-            if flow.is_break() {
-                break 'vtables;
+                }
+            }
+        }
+        out
+    };
+
+    let mut confirmed: Vec<Option<Located>> = vec![None; sizes.len()];
+    let mut examined = 0usize;
+    let end = scan_batches(&chunks, cancel, worker, |candidates, done| {
+        let mut flow = ControlFlow::Continue(());
+        for c in candidates {
+            examined += 1;
+            if confirmed[c.size_index].is_some() {
+                continue;
+            }
+            if validate_loose(mem, profile, c.at.table_addr, sizes[c.size_index]) {
+                confirmed[c.size_index] = Some(c.at);
+                if c.size_index == 0 {
+                    flow = ControlFlow::Break(());
+                    break;
+                }
             }
         }
         on_event(ScanEvent::Progress {
-            scanned: i as u32 + 1,
+            scanned: done as u32,
             total,
-            hits: candidates.len() as u32 + u32::from(confirmed.is_some()),
+            hits: examined as u32,
         });
-        if cancel.load(Ordering::Relaxed) {
-            return Err(InjectError::Cancelled);
-        }
-        if confirmed.is_some() {
-            break;
-        }
+        flow
+    });
+    if end == ScanEnd::Cancelled {
+        return Err(InjectError::Cancelled);
     }
-    if confirmed.is_some() {
-        return Ok(confirmed);
-    }
+    Ok(confirmed
+        .iter()
+        .zip(sizes)
+        .find_map(|(at, &layers)| at.map(|at| Found { at, layers })))
+}
 
-    Ok(candidates
-        .into_iter()
-        .map(|c| (count_loose(mem, profile, c.table_addr, count), c))
-        .max_by_key(|(valid, _)| *valid)
-        .filter(|(valid, _)| *valid as f64 >= count as f64 * RTTI_TABLE_THRESHOLD)
-        .map(|(_, c)| c))
+fn validate_loose(
+    mem: &dyn ProcessMemory,
+    profile: &GameProfile,
+    table: u64,
+    count: usize,
+) -> bool {
+    let layout = &profile.layout;
+    let sane = |ptr: u64| loose_valid_layer(mem, layout, ptr);
+    (0..count.min(SAMPLE_LAYERS)).all(|k| sane(read_table_ptr(mem, table, k)))
+        && count_where(mem, table, count, sane) as f64 >= count as f64 * RTTI_TABLE_THRESHOLD
 }
 
 /// Reads the whole layer-pointer table in one go (falls back to per-pointer reads).
@@ -367,5 +460,19 @@ pub fn read_layer_table(mem: &dyn ProcessMemory, table_addr: u64, count: usize) 
         None => (0..count)
             .map(|k| read_table_ptr(mem, table_addr, k))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_set_membership() {
+        let set = CountSet::new(&[10, 500, 3000, 70_000]);
+        assert!(set.contains(10) && set.contains(500) && set.contains(3000));
+        assert!(!set.contains(11) && !set.contains(0));
+        // 70_000 does not fit a u16 and must simply be ignored.
+        assert!(!set.contains((70_000u32 & 0xFFFF) as u16));
     }
 }

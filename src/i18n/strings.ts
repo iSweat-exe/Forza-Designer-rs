@@ -72,7 +72,7 @@ const en = {
   attached: 'Attached to the game (pid {pid}){build}',
   buildSuffix: ', build {build}',
   scanning: 'Scanning memory for a {n}-layer template…',
-  scanRegions: '{done} / {total} memory regions',
+  scanRegions: '{done} / {total} memory blocks',
   rttiFallback:
     'No fresh template found. Falling back to the slower type scan (can take 2–5 minutes). Do not click anything.',
   rttiPhase1: 'Type scan 1/4 — locating the class name',
@@ -168,7 +168,7 @@ const fr: Record<StringKey, string> = {
   attached: 'Attaché au jeu (pid {pid}){build}',
   buildSuffix: ', build {build}',
   scanning: 'Recherche d’un modèle de {n} calques dans la mémoire…',
-  scanRegions: '{done} / {total} régions mémoire',
+  scanRegions: '{done} / {total} blocs mémoire',
   rttiFallback:
     'Aucun modèle neuf trouvé. Passage au scan par type, plus lent (2 à 5 minutes). Ne cliquez sur rien.',
   rttiPhase1: 'Scan par type 1/4 — recherche du nom de classe',

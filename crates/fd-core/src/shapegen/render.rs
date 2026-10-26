@@ -4,7 +4,8 @@ use image::codecs::png::PngEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 
-use super::shape::{Mask, Shape};
+use super::raster::Spans;
+use super::shape::Shape;
 use crate::error::{Error, Result};
 
 /// Renders `shapes` in order as fully opaque layers (what Forza draws).
@@ -12,20 +13,15 @@ use crate::error::{Error, Result};
 pub fn render_shapes(shapes: &[Shape], w: usize, h: usize, background: Option<[u8; 3]>) -> Vec<u8> {
     let bg = background.map_or([0, 0, 0, 0], |[r, g, b]| [r, g, b, 255]);
     let mut out: Vec<u8> = bg.iter().copied().cycle().take(w * h * 4).collect();
-    let mut mask = Mask::default();
+    let mut spans = Spans::default();
     for shape in shapes {
-        if !shape.rasterize(w, h, &mut mask) {
+        if !shape.spans(w, h, &mut spans) {
             continue;
         }
         let [r, g, b, _] = shape.color();
-        let bb = mask.bbox;
-        let bw = bb.width();
-        for (row, y) in (bb.y0..bb.y1).enumerate() {
-            for (col, x) in (bb.x0..bb.x1).enumerate() {
-                if mask.data[row * bw + col] {
-                    let i = (y * w + x) * 4;
-                    out[i..i + 4].copy_from_slice(&[r, g, b, 255]);
-                }
+        for s in &spans.rows {
+            for px in out[(s.y * w + s.x0) * 4..(s.y * w + s.x1) * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(&[r, g, b, 255]);
             }
         }
     }

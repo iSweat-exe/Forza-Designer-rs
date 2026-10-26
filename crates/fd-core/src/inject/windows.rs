@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, PAGE_EXECUTE,
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY,
 };
@@ -37,6 +37,8 @@ const READABLE: u32 = PAGE_READONLY
     | PAGE_EXECUTE_WRITECOPY;
 const WRITABLE: u32 =
     PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+const EXECUTABLE: u32 =
+    PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 /// Highest user-mode address on x64 Windows.
 const USER_CEILING: u64 = 0x7FFF_FFFF_FFFF;
 
@@ -74,6 +76,12 @@ pub struct GameProcess {
     handle: HANDLE,
     pid: u32,
 }
+
+// SAFETY: a process handle is just a kernel object reference. ReadProcessMemory,
+// WriteProcessMemory and VirtualQueryEx are safe to call concurrently from any
+// thread; the handle is closed exactly once, in `Drop`.
+unsafe impl Send for GameProcess {}
+unsafe impl Sync for GameProcess {}
 
 impl GameProcess {
     pub fn attach(game: &'static GameProfile) -> Result<Self, InjectError> {
@@ -238,6 +246,7 @@ impl ProcessMemory for GameProcess {
                     },
                     readable: ok_protect && mbi.Protect & READABLE != 0,
                     writable: ok_protect && mbi.Protect & WRITABLE != 0,
+                    executable: mbi.Protect & EXECUTABLE != 0,
                 });
             }
             match base.checked_add(size) {

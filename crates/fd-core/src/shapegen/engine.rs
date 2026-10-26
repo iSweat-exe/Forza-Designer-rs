@@ -8,8 +8,9 @@ use rayon::prelude::*;
 
 use super::preprocess::Target;
 use super::profile::Profile;
+use super::raster::Spans;
 use super::scoring::{self, Fit};
-use super::shape::{Mask, Shape, ShapeKind};
+use super::shape::{Shape, ShapeKind};
 use crate::error::{Error, Result};
 
 /// After this many failed attempts in a row we give up and finish early.
@@ -71,6 +72,8 @@ pub struct Engine {
     profile: Profile,
     target: Target,
     edge: Vec<f32>,
+    /// Row prefix sums of opaque pixels (see `scoring::opaque_prefix`).
+    opaque: Vec<u32>,
     canvas: Vec<u8>,
     shapes: Vec<Shape>,
     full_sq: f64,
@@ -96,13 +99,16 @@ impl Engine {
         let edge =
             scoring::compute_edge_weight(&target.rgb, &target.alpha, target.width, target.height);
         let canvas = vec![INITIAL_GREY; target.width * target.height * 3];
-        let (full_sq, norm) = scoring::canvas_error(&canvas, &fit_of(&target, &edge, &profile));
+        let opaque = scoring::opaque_prefix(&target.alpha, target.width, target.height);
+        let (full_sq, norm) =
+            scoring::canvas_error(&canvas, &fit_of(&target, &edge, &opaque, &profile));
         let seed = if seed == 0 { time_seed() } else { seed };
         let workers = worker_count(profile.max_threads, profile.random_samples);
         Ok(Self {
             profile,
             target,
             edge,
+            opaque,
             canvas,
             shapes: Vec::new(),
             full_sq,
@@ -151,7 +157,7 @@ impl Engine {
         let kinds = self.profile.shape_types.clone();
         let mut type_cursor = 0usize;
         let mut skips = 0usize;
-        let mut mask = Mask::default();
+        let mut mask = Spans::default();
         let stop_at = self.profile.stop_at;
 
         while self.shapes.len() < stop_at && !self.control.is_stopped() {
@@ -189,7 +195,7 @@ impl Engine {
             };
             skips = 0;
 
-            let fit = fit_of(&self.target, &self.edge, &self.profile);
+            let fit = fit_of(&self.target, &self.edge, &self.opaque, &self.profile);
             self.full_sq += scoring::composite(&mut shape, &mut self.canvas, &fit, &mut mask);
             self.shapes.push(shape);
             let count = self.shapes.len();
@@ -226,7 +232,7 @@ impl Engine {
     /// One independent search per worker; the global best wins.
     fn parallel_search(&mut self, kind: ShapeKind, size_cap: f32) -> Option<(f64, Shape)> {
         let seeds: Vec<u64> = (0..self.workers).map(|_| self.rng.random()).collect();
-        let fit = fit_of(&self.target, &self.edge, &self.profile);
+        let fit = fit_of(&self.target, &self.edge, &self.opaque, &self.profile);
         let base = (self.full_sq, self.norm);
         let (n_random, n_mutate) = (
             self.profile.random_samples.max(1),
@@ -253,7 +259,7 @@ fn search(
     seed: u64,
 ) -> Option<(f64, Shape)> {
     let mut rng = SmallRng::seed_from_u64(seed);
-    let mut mask = Mask::default();
+    let mut mask = Spans::default();
     let mut best: Option<(f64, Shape)> = None;
 
     for _ in 0..n_random {
@@ -293,13 +299,19 @@ fn search(
     Some((best_score, best_shape))
 }
 
-fn fit_of<'a>(target: &'a Target, edge: &'a [f32], profile: &Profile) -> Fit<'a> {
+fn fit_of<'a>(
+    target: &'a Target,
+    edge: &'a [f32],
+    opaque: &'a [u32],
+    profile: &Profile,
+) -> Fit<'a> {
     Fit {
         w: target.width,
         h: target.height,
         target: &target.rgb,
         alpha: &target.alpha,
         edge,
+        opaque_prefix: opaque,
         shape_alpha: profile.shape_alpha,
     }
 }
@@ -385,7 +397,12 @@ mod tests {
     fn incremental_error_matches_a_full_recompute() {
         let mut engine = Engine::new(target(), profile(15), 7, Control::default()).unwrap();
         engine.run(|_| {}).unwrap();
-        let fit = fit_of(&engine.target, &engine.edge, &engine.profile);
+        let fit = fit_of(
+            &engine.target,
+            &engine.edge,
+            &engine.opaque,
+            &engine.profile,
+        );
         let (full, n) = scoring::canvas_error(&engine.canvas, &fit);
         assert!((scoring::rms(full, n) - engine.rms()).abs() < 0.01);
     }

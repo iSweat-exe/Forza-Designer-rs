@@ -3,7 +3,8 @@
 //! Everything works on flat row-major buffers: `rgb` is `w * h * 3` bytes,
 //! `alpha` / `edge` are `w * h`.
 
-use super::shape::{Mask, Rgba, Shape};
+use super::raster::Spans;
+use super::shape::{Rgba, Shape};
 
 /// How much more an edge pixel counts than a smooth one (weights are 1..=EDGE_BOOST).
 /// Without it the search drifts to big blobs that average well but miss eyes,
@@ -21,6 +22,8 @@ pub struct Fit<'a> {
     pub target: &'a [u8],
     pub alpha: &'a [u8],
     pub edge: &'a [f32],
+    /// See [`opaque_prefix`].
+    pub opaque_prefix: &'a [u32],
     pub shape_alpha: u8,
 }
 
@@ -100,27 +103,24 @@ pub fn rms(full_sq: f64, n: f64) -> f64 {
 
 /// Closed-form colour minimising the squared error over the shape (weighted by
 /// opacity of the target there), for `out = a*src + (1-a)*dst` compositing.
-fn optimal_color(mask: &Mask, canvas: &[u8], fit: &Fit<'_>) -> Rgba {
+fn optimal_color(spans: &Spans, canvas: &[u8], fit: &Fit<'_>) -> Rgba {
     let a_byte = fit.shape_alpha;
     let a = f32::from(a_byte) / 255.0;
-    let bb = mask.bbox;
     if a < 1e-6 {
         return [0, 0, 0, a_byte];
     }
     let (mut weight, mut sum) = (0.0f32, [0.0f32; 3]);
-    let bw = bb.width();
-    for (row, y) in (bb.y0..bb.y1).enumerate() {
-        for (col, x) in (bb.x0..bb.x1).enumerate() {
-            if !mask.data[row * bw + col] {
-                continue;
-            }
-            let idx = y * fit.w + x;
-            let m = f32::from(fit.alpha[idx]) / 255.0;
+    for s in &spans.rows {
+        let first = s.y * fit.w + s.x0;
+        let last = s.y * fit.w + s.x1;
+        let alpha = &fit.alpha[first..last];
+        let tgt = fit.target[first * 3..last * 3].chunks_exact(3);
+        let cur = canvas[first * 3..last * 3].chunks_exact(3);
+        for ((&al, t), c) in alpha.iter().zip(tgt).zip(cur) {
+            let m = f32::from(al) / 255.0;
             weight += m;
             for k in 0..3 {
-                let tgt = f32::from(fit.target[idx * 3 + k]);
-                let cur = f32::from(canvas[idx * 3 + k]);
-                sum[k] += m * (tgt - (1.0 - a) * cur) / a;
+                sum[k] += m * (f32::from(t[k]) - (1.0 - a) * f32::from(c[k])) / a;
             }
         }
     }
@@ -144,31 +144,26 @@ pub fn score_shape(
     canvas: &[u8],
     fit: &Fit<'_>,
     base: (f64, f64),
-    mask: &mut Mask,
+    spans: &mut Spans,
 ) -> (f64, Rgba) {
-    if !shape.rasterize(fit.w, fit.h, mask) {
+    if !shape.spans(fit.w, fit.h, spans) {
         return (f64::INFINITY, shape.color());
     }
-    let bb = mask.bbox;
-    let bw = bb.width();
 
     // Sticker contract: the body must sit (almost) entirely on opaque pixels.
-    let (mut body, mut inside, mut any_opaque) = (0usize, 0usize, false);
-    for (row, y) in (bb.y0..bb.y1).enumerate() {
-        for (col, x) in (bb.x0..bb.x1).enumerate() {
-            let opaque = fit.alpha[y * fit.w + x] >= 128;
-            any_opaque |= opaque;
-            if mask.data[row * bw + col] {
-                body += 1;
-                inside += usize::from(opaque);
-            }
-        }
+    // Opaque pixels per span come from the row prefix sums in O(1).
+    let stride = fit.w + 1;
+    let (mut body, mut inside) = (0usize, 0usize);
+    for s in &spans.rows {
+        body += s.x1 - s.x0;
+        let row = s.y * stride;
+        inside += (fit.opaque_prefix[row + s.x1] - fit.opaque_prefix[row + s.x0]) as usize;
     }
-    if body == 0 || !any_opaque || (inside as f32) / (body as f32) < STICKER_OVERLAP_MIN {
+    if body == 0 || (inside as f32) / (body as f32) < STICKER_OVERLAP_MIN {
         return (f64::INFINITY, shape.color());
     }
 
-    let color = optimal_color(mask, canvas, fit);
+    let color = optimal_color(spans, canvas, fit);
     let a = f32::from(color[3]) / 255.0;
     let src = [
         f32::from(color[0]),
@@ -177,21 +172,21 @@ pub fn score_shape(
     ];
 
     let mut delta = 0.0f64;
-    for (row, y) in (bb.y0..bb.y1).enumerate() {
-        for (col, x) in (bb.x0..bb.x1).enumerate() {
-            if !mask.data[row * bw + col] {
-                continue;
-            }
-            let idx = y * fit.w + x;
-            let wt = fit.edge[idx];
+    for s in &spans.rows {
+        let first = s.y * fit.w + s.x0;
+        let last = s.y * fit.w + s.x1;
+        let edge = &fit.edge[first..last];
+        let alpha = &fit.alpha[first..last];
+        let tgt = fit.target[first * 3..last * 3].chunks_exact(3);
+        let cur = canvas[first * 3..last * 3].chunks_exact(3);
+        for (((&wt, &al), t), c) in edge.iter().zip(alpha).zip(tgt).zip(cur) {
             if wt == 0.0 {
                 continue;
             }
-            let m = f32::from(fit.alpha[idx]) / 255.0;
+            let m = f32::from(al) / 255.0;
             let mut d = 0.0f32;
             for k in 0..3 {
-                let cur = f32::from(canvas[idx * 3 + k]);
-                let tgt = f32::from(fit.target[idx * 3 + k]);
+                let (cur, tgt) = (f32::from(c[k]), f32::from(t[k]));
                 let blended = cur + m * a * (src[k] - cur);
                 d += (blended - tgt).powi(2) - (cur - tgt).powi(2);
             }
@@ -203,39 +198,50 @@ pub fn score_shape(
 
 /// Paint `shape` onto `canvas` with its optimal colour (stored back into the
 /// shape). Returns the change in the weighted squared error.
-pub fn composite(shape: &mut Shape, canvas: &mut [u8], fit: &Fit<'_>, mask: &mut Mask) -> f64 {
-    if !shape.rasterize(fit.w, fit.h, mask) {
+pub fn composite(shape: &mut Shape, canvas: &mut [u8], fit: &Fit<'_>, spans: &mut Spans) -> f64 {
+    if !shape.spans(fit.w, fit.h, spans) {
         return 0.0;
     }
-    let color = optimal_color(mask, canvas, fit);
+    let color = optimal_color(spans, canvas, fit);
     shape.set_color(color);
     let a = f32::from(color[3]) / 255.0;
-    let bb = mask.bbox;
-    let bw = bb.width();
     let mut delta = 0.0f64;
-    for (row, y) in (bb.y0..bb.y1).enumerate() {
-        for (col, x) in (bb.x0..bb.x1).enumerate() {
-            if !mask.data[row * bw + col] {
-                continue;
-            }
-            let idx = y * fit.w + x;
-            let m = f32::from(fit.alpha[idx]) / 255.0;
+    for s in &spans.rows {
+        let first = s.y * fit.w + s.x0;
+        let last = s.y * fit.w + s.x1;
+        let edge = &fit.edge[first..last];
+        let alpha = &fit.alpha[first..last];
+        let tgt = fit.target[first * 3..last * 3].chunks_exact(3);
+        let cur = canvas[first * 3..last * 3].chunks_exact_mut(3);
+        for (((&wt, &al), t), c) in edge.iter().zip(alpha).zip(tgt).zip(cur) {
+            let m = f32::from(al) / 255.0;
             if m == 0.0 {
                 continue;
             }
-            let wt = fit.edge[idx];
             let mut d = 0.0f32;
             for k in 0..3 {
-                let cur = f32::from(canvas[idx * 3 + k]);
-                let tgt = f32::from(fit.target[idx * 3 + k]);
-                let new = (cur + m * a * (f32::from(color[k]) - cur)).clamp(0.0, 255.0) as u8;
-                canvas[idx * 3 + k] = new;
-                d += (f32::from(new) - tgt).powi(2) - (cur - tgt).powi(2);
+                let (old, tgt) = (f32::from(c[k]), f32::from(t[k]));
+                let new = (old + m * a * (f32::from(color[k]) - old)).clamp(0.0, 255.0) as u8;
+                c[k] = new;
+                d += (f32::from(new) - tgt).powi(2) - (old - tgt).powi(2);
             }
             delta += f64::from(d * wt);
         }
     }
     delta
+}
+
+/// Row-wise prefix sums of "is opaque" (`alpha >= 128`): `(w + 1)` entries per
+/// row, so the opaque count of `x0..x1` on row `y` is `p[y*(w+1)+x1] - p[y*(w+1)+x0]`.
+pub fn opaque_prefix(alpha: &[u8], w: usize, h: usize) -> Vec<u32> {
+    let mut out = vec![0u32; (w + 1) * h];
+    for y in 0..h {
+        let row = &mut out[y * (w + 1)..(y + 1) * (w + 1)];
+        for x in 0..w {
+            row[x + 1] = row[x] + u32::from(alpha[y * w + x] >= 128);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -249,6 +255,7 @@ mod tests {
         alpha: Vec<u8>,
         edge: Vec<f32>,
         canvas: Vec<u8>,
+        opaque: Vec<u32>,
     }
 
     /// 40x40, opaque everywhere except a 4px border; left half red, right half blue.
@@ -277,6 +284,7 @@ mod tests {
         Scene {
             w,
             h,
+            opaque: opaque_prefix(&alpha, w, h),
             canvas: vec![40; w * h * 3],
             target,
             alpha,
@@ -291,6 +299,7 @@ mod tests {
             target: &s.target,
             alpha: &s.alpha,
             edge: &s.edge,
+            opaque_prefix: &s.opaque,
             shape_alpha: 255,
         }
     }
@@ -321,7 +330,7 @@ mod tests {
             hh: 6.0,
             color: [0, 0, 0, 255],
         };
-        let mut mask = Mask::default();
+        let mut mask = Spans::default();
         let (score, color) = score_shape(&shape, &s.canvas, &f, base, &mut mask);
         assert_eq!(color, [200, 20, 20, 255]);
         assert!(score < rms(base.0, base.1));
@@ -339,7 +348,7 @@ mod tests {
             hh: 6.0,
             color: [0; 4],
         };
-        let (score, _) = score_shape(&shape, &s.canvas, &f, base, &mut Mask::default());
+        let (score, _) = score_shape(&shape, &s.canvas, &f, base, &mut Spans::default());
         assert!(score.is_infinite());
     }
 
@@ -347,13 +356,19 @@ mod tests {
     fn composite_delta_matches_full_recompute() {
         let mut s = scene();
         let (w, h) = (s.w, s.h);
-        let (target, alpha, edge) = (s.target.clone(), s.alpha.clone(), s.edge.clone());
+        let (target, alpha, edge, opaque) = (
+            s.target.clone(),
+            s.alpha.clone(),
+            s.edge.clone(),
+            s.opaque.clone(),
+        );
         let f = Fit {
             w,
             h,
             target: &target,
             alpha: &alpha,
             edge: &edge,
+            opaque_prefix: &opaque,
             shape_alpha: 200,
         };
         let (full0, n) = canvas_error(&s.canvas, &f);
@@ -365,7 +380,7 @@ mod tests {
             angle: 30.0,
             color: [0, 0, 0, 200],
         };
-        let delta = composite(&mut shape, &mut s.canvas, &f, &mut Mask::default());
+        let delta = composite(&mut shape, &mut s.canvas, &f, &mut Spans::default());
         let (full1, _) = canvas_error(&s.canvas, &f);
         assert!(
             ((full0 + delta) - full1).abs() < 1.0,
@@ -380,13 +395,19 @@ mod tests {
     fn score_predicts_committed_error() {
         let mut s = scene();
         let (w, h) = (s.w, s.h);
-        let (target, alpha, edge) = (s.target.clone(), s.alpha.clone(), s.edge.clone());
+        let (target, alpha, edge, opaque) = (
+            s.target.clone(),
+            s.alpha.clone(),
+            s.edge.clone(),
+            s.opaque.clone(),
+        );
         let f = Fit {
             w,
             h,
             target: &target,
             alpha: &alpha,
             edge: &edge,
+            opaque_prefix: &opaque,
             shape_alpha: 255,
         };
         let base = canvas_error(&s.canvas, &f);
@@ -396,8 +417,8 @@ mod tests {
             r: 8.0,
             color: [0, 0, 0, 255],
         };
-        let (predicted, _) = score_shape(&shape, &s.canvas, &f, base, &mut Mask::default());
-        let d = composite(&mut shape, &mut s.canvas, &f, &mut Mask::default());
+        let (predicted, _) = score_shape(&shape, &s.canvas, &f, base, &mut Spans::default());
+        let d = composite(&mut shape, &mut s.canvas, &f, &mut Spans::default());
         // Prediction ignores u8 truncation of the committed pixels; allow a hair of slack.
         assert!((predicted - rms(base.0 + d, base.1)).abs() < 0.05);
     }

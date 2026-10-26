@@ -153,27 +153,22 @@ fn find_group(
 ) -> Result<(Located, usize, LocateMethod), InjectError> {
     let sizes = candidate_sizes(shapes);
 
-    // Phase 1: fast sphere scan for every plausible template size, BEFORE any slow
-    // fallback (otherwise a tiny JSON would pay a multi-minute RTTI scan hunting a
-    // template of its own size while a 1500-layer one sits right there).
-    for &count in &sizes {
-        on_event(InjectEvent::Scanning { layers: count });
-        let found = locator::locate_by_sphere_scan(mem, profile, count, cancel, &mut |e| {
-            forward_scan(e, on_event)
-        })?;
-        if let Some(l) = found {
-            return Ok((l, count, LocateMethod::SphereScan));
-        }
+    // Phase 1: fast sphere scan, one pass over the heap for every plausible
+    // template size, BEFORE any slow fallback (a tiny JSON must not pay a
+    // multi-minute RTTI scan while a 1500-layer template sits right there).
+    on_event(InjectEvent::Scanning { layers: sizes[0] });
+    if let Some(f) = locator::locate_by_sphere_scan(mem, profile, &sizes, cancel, &mut |e| {
+        forward_scan(e, on_event)
+    })? {
+        return Ok((f.at, f.layers, LocateMethod::SphereScan));
     }
 
     // Phase 2: RTTI (works on already-painted templates; slow).
     on_event(InjectEvent::RttiFallback);
-    for &count in &sizes {
-        if let Some(l) = locator::locate_by_rtti(mem, profile, count, cancel, &mut |e| {
-            forward_scan(e, on_event)
-        })? {
-            return Ok((l, count, LocateMethod::Rtti));
-        }
+    if let Some(f) = locator::locate_by_rtti(mem, profile, &sizes, cancel, &mut |e| {
+        forward_scan(e, on_event)
+    })? {
+        return Ok((f.at, f.layers, LocateMethod::Rtti));
     }
     Err(InjectError::NoMatch)
 }
@@ -246,9 +241,15 @@ fn write_layer(
     mem.write(ptr + layout.position_offset, &f2(v.position))?;
     mem.write(ptr + layout.scale_offset, &f2(v.scale))?;
     mem.write(ptr + layout.rotation_offset, &v.rotation.to_le_bytes())?;
-    mem.write(ptr + layout.color_offset, &v.color)?;
+    if layout.mask_offset == layout.color_offset + 4 {
+        // Colour and mask are adjacent: one syscall instead of two.
+        let [r, g, b, a] = v.color;
+        mem.write(ptr + layout.color_offset, &[r, g, b, a, 0])?;
+    } else {
+        mem.write(ptr + layout.color_offset, &v.color)?;
+        mem.write(ptr + layout.mask_offset, &[0])?;
+    }
     mem.write(ptr + layout.shape_id_offset, &[v.shape_id])?;
-    mem.write(ptr + layout.mask_offset, &[0])?;
     Ok(8 + 8 + 4 + 4 + 1 + 1)
 }
 
@@ -438,5 +439,117 @@ mod tests {
         let group = build_group(&p, 0x100, 20, true, 0);
         p.poke(layer_addr(&p, group, 3) + 0x78, &[9]);
         assert!(matches!(run(&p, &[ellipse(0)]), Err(InjectError::NoMatch)));
+    }
+
+    #[test]
+    fn prefers_the_exact_template_size_over_a_bigger_one() {
+        let p = world();
+        build_group(&p, 0x100, 20, true, 0);
+        build_group(&p, 0x8000, 10, true, 0);
+        let shapes: Vec<_> = (0..10).map(ellipse).collect();
+        assert_eq!(run(&p, &shapes).unwrap().slots, 10);
+    }
+
+    #[test]
+    fn without_an_exact_size_the_earliest_listed_template_wins() {
+        // sizes tried for 5 shapes: [5, 500, 1500, 3000, 1000, 100, 50, 20, 10]
+        let p = world();
+        build_group(&p, 0x100, 10, true, 0);
+        build_group(&p, 0x8000, 20, true, 0);
+        let shapes: Vec<_> = (0..5).map(ellipse).collect();
+        assert_eq!(run(&p, &shapes).unwrap().slots, 20);
+    }
+
+    #[test]
+    fn every_template_size_is_searched_in_a_single_heap_pass() {
+        let p = world();
+        assert!(matches!(run(&p, &[ellipse(0)]), Err(InjectError::NoMatch)));
+        // 9 candidate sizes used to mean 9 full passes over the heap.
+        assert!(
+            p.bytes_read_from(HEAP) < 2 * 0x20_000,
+            "{}",
+            p.bytes_read_from(HEAP)
+        );
+    }
+
+    #[test]
+    fn finds_a_group_that_starts_in_the_previous_scan_chunk() {
+        let chunk = crate::inject::memory::SCAN_CHUNK as u64;
+        let p = MockProcess::new().with_module_base(0x1_4000_0000);
+        p.add(HEAP, chunk as usize + 0x20_000, RegionKind::Private, true);
+        // The group (8-aligned) starts in chunk 0 but its count field lands in chunk 1.
+        let group = build_group(&p, chunk - 88, 10, true, 0);
+        let report = run(&p, &[ellipse(0)]).unwrap();
+        assert_eq!(report.written, 1);
+        assert_eq!(
+            p.peek_f32s(layer_addr(&p, group, 0) + 0x18, 2),
+            vec![100.0, -50.0]
+        );
+    }
+
+    #[test]
+    fn writing_clears_a_set_mask_flag() {
+        let p = world();
+        let group = build_group(&p, 0x100, 10, true, 0);
+        let l0 = layer_addr(&p, group, 0);
+        p.poke(l0 + 0x78, &[1]); // still a plausible fresh layer
+        run(&p, &[ellipse(0)]).unwrap();
+        assert_eq!(p.peek(l0 + 0x74, 5), vec![10, 20, 30, 255, 0]);
+    }
+
+    #[test]
+    fn rtti_scan_never_reads_code_pages_when_data_pages_suffice() {
+        let module = 0x1_4000_0000u64;
+        let code = 0x2_0000_0000u64;
+        let p = MockProcess::new().with_module_base(module);
+        p.add(module, 0x4000, RegionKind::Image, false);
+        p.add_code(code, 0x10_000);
+        p.add(HEAP, 0x20_000, RegionKind::Private, true);
+        p.poke(module + 0x1010, b".?AVCLiveryGroup@@\0");
+        p.poke(module + 0x2000, &1u32.to_le_bytes());
+        p.poke(module + 0x200C, &0x1000u32.to_le_bytes());
+        p.poke_u64(module + 0x3000, module + 0x2000);
+        build_group(&p, 0x100, 10, false, module + 0x3008);
+        let report = run(&p, &[ellipse(0)]).unwrap();
+        assert_eq!(report.method, LocateMethod::Rtti);
+        assert_eq!(p.bytes_read_from(code), 0);
+    }
+
+    #[test]
+    fn rtti_falls_back_to_code_pages_when_the_data_pages_have_no_class_name() {
+        let module = 0x1_4000_0000u64;
+        let p = MockProcess::new().with_module_base(module);
+        // Everything (as in a packed executable) sits in one executable image block.
+        p.add_code(module, 0x4000);
+        p.add(HEAP, 0x20_000, RegionKind::Private, true);
+        p.poke(module + 0x1010, b".?AVCLiveryGroup@@\0");
+        p.poke(module + 0x2000, &1u32.to_le_bytes());
+        p.poke(module + 0x200C, &0x1000u32.to_le_bytes());
+        p.poke_u64(module + 0x3000, module + 0x2000);
+        build_group(&p, 0x100, 10, false, module + 0x3008);
+        assert_eq!(run(&p, &[ellipse(0)]).unwrap().method, LocateMethod::Rtti);
+    }
+
+    /// Throughput of the sphere scan over a large, mostly-noisy heap.
+    /// `cargo test --release -p fd-core scan_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn scan_throughput() {
+        let size = 256 * 1024 * 1024usize;
+        let p = MockProcess::new().with_module_base(0x1_4000_0000);
+        p.add(HEAP, size, RegionKind::Private, true);
+        // Sprinkle values equal to common layer counts so the pre-filter has work to do.
+        let noise = 500u16.to_le_bytes();
+        for i in (0..size - 16).step_by(4096) {
+            p.poke(HEAP + i as u64, &noise);
+        }
+        let started = std::time::Instant::now();
+        let r = run(&p, &[ellipse(0)]);
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "{} MiB scanned in {secs:.2}s = {:.0} MiB/s ({r:?})",
+            size >> 20,
+            (size >> 20) as f64 / secs
+        );
     }
 }

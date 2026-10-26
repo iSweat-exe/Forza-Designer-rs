@@ -3,6 +3,7 @@
 mod engine;
 mod preprocess;
 mod profile;
+mod raster;
 mod render;
 mod scoring;
 mod shape;
