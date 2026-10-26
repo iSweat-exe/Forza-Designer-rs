@@ -98,5 +98,5 @@ MIT. Contains ideas and bundled quality profiles from Forza Designer 6 — see `
   (`cargo audit`, `npm audit`), and (on the default branch) a Windows build artifact.
 * `.github/workflows/release.yml` — push a tag `vX.Y.Z` (it must match the version in `Cargo.toml`, `package.json`
   and `tauri.conf.json`; use `node scripts/version.mjs --set X.Y.Z`). Tests run first, then an NSIS installer
-  (Windows) and AppImage/deb (Linux) are attached to a **draft** GitHub release.
+  (Windows) and AppImage/deb (Linux) are attached to a published GitHub release.
 * Dependabot keeps Cargo, npm and Actions dependencies current (grouped weekly PRs).
