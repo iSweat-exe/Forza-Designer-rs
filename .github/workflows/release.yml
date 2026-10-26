@@ -4,10 +4,11 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
+  # Manual run: builds the selected branch and creates the tag if it does not exist yet.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build (e.g. v0.2.0)'
+        description: 'Release tag to create/build (e.g. v1.0.0); must match the app version'
         required: true
 
 permissions:
@@ -26,8 +27,6 @@ jobs:
       - id: tag
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -41,8 +40,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.verify.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -68,8 +65,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.verify.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -87,6 +82,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ needs.verify.outputs.tag }}
+          releaseCommitish: ${{ github.sha }}
           releaseName: Forza Designer ${{ needs.verify.outputs.tag }}
           releaseBody: |
             Windows: run the installer. Injection needs the game and this app to run as Administrator.
