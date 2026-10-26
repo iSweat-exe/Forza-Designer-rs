@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/fd-core", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The shape search is the hot loop; keep tests usable in debug builds.
+[profile.dev.package.fd-core]
+opt-level = 2
