@@ -552,4 +552,97 @@ mod tests {
             (size >> 20) as f64 / secs
         );
     }
+
+    #[test]
+    fn offset_overrides_change_what_is_written_and_are_reported() {
+        let p = world();
+        let group = build_group(&p, 0x100, 10, true, 0);
+        let options = InjectOptions {
+            offset_overrides: Some(serde_json::json!({"fh6": {"scale_divisor_ellipse": 126.0}})),
+        };
+        let report = inject(
+            &p,
+            &FH6,
+            &[ellipse(0)],
+            &options,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.overrides_applied, vec!["scale_divisor_ellipse"]);
+        // rx 63 / 126 = 0.5 instead of 1.0.
+        assert_eq!(
+            p.peek_f32s(layer_addr(&p, group, 0) + 0x28, 2),
+            vec![0.5, 0.25]
+        );
+    }
+
+    #[test]
+    fn the_report_counts_shapes_per_type() {
+        let p = world();
+        build_group(&p, 0x100, 10, true, 0);
+        let shapes = vec![
+            ellipse(0),
+            ellipse(1),
+            Shape::Rectangle {
+                x: 1.0,
+                y: 1.0,
+                hw: 2.0,
+                hh: 2.0,
+                color: [1, 2, 3, 4],
+            },
+        ];
+        let report = run(&p, &shapes).unwrap();
+        assert_eq!(report.type_counts.get("rotated_ellipse"), Some(&2));
+        assert_eq!(report.type_counts.get("rectangle"), Some(&1));
+        assert_eq!(report.validated_build, FH6.validated_build);
+    }
+
+    #[test]
+    fn progress_events_cover_scan_locate_and_every_write() {
+        let p = world();
+        build_group(&p, 0x100, 10, true, 0);
+        let mut events = Vec::new();
+        let shapes: Vec<_> = (0..3).map(ellipse).collect();
+        inject(
+            &p,
+            &FH6,
+            &shapes,
+            &InjectOptions::default(),
+            &AtomicBool::new(false),
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(InjectEvent::Scanning { layers: 3 })
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InjectEvent::ScanProgress { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InjectEvent::Located { slots: 10, .. })));
+        let writes: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let InjectEvent::Writing { written, .. } = e {
+                    Some(*written)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(writes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_read_only_heap_is_never_treated_as_a_template() {
+        // Only writable memory is searched, so read-only data can't be mistaken for a template.
+        let p = MockProcess::new().with_module_base(0x1_4000_0000);
+        p.add(HEAP, 0x20_000, RegionKind::Private, false);
+        build_group(&p, 0x100, 10, true, 0);
+        let report = run(&p, &[ellipse(0)]);
+        assert!(matches!(report, Err(InjectError::NoMatch)));
+    }
 }

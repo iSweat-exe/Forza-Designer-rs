@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import { api, errorMessage, pickDocument } from '../api/commands';
 import type { DocumentInfo, GameInfo, InjectReport } from '../api/types';
 import { useAsyncResource } from '../hooks/useAsyncResource';
 import { useInjection, type InjectionState } from '../hooks/useInjection';
+import { useKeyedAsync } from '../hooks/useKeyedAsync';
 import { useI18n } from '../i18n/I18nProvider';
 import type { StringKey } from '../i18n/strings';
 import { baseName } from '../lib';
@@ -16,13 +17,13 @@ interface Props {
 }
 
 const DOC_PREVIEW_SIDE = 560;
+const renderPreview = (path: string) => api.renderDocument(path, DOC_PREVIEW_SIDE);
 
 export function InjectTab({ document, onDocument }: Props) {
   const { t } = useI18n();
   const games = useAsyncResource(api.listGames);
   const { state, start, cancel, reset } = useInjection();
   const [gameKey, setGameKey] = useState<string | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const gameList = games.data;
@@ -30,21 +31,7 @@ export function InjectTab({ document, onDocument }: Props) {
   const busy = state.phase === 'running';
 
   // Render the chosen document the way the game will draw it.
-  const docPath = document?.path ?? null;
-  useEffect(() => {
-    if (!docPath) {
-      setPreview(null);
-      return;
-    }
-    let cancelled = false;
-    api
-      .renderDocument(docPath, DOC_PREVIEW_SIDE)
-      .then((png) => !cancelled && setPreview(png))
-      .catch(() => !cancelled && setPreview(null));
-    return () => {
-      cancelled = true;
-    };
-  }, [docPath]);
+  const { data: preview } = useKeyedAsync(document?.path ?? null, renderPreview);
 
   const choose = async () => {
     const picked = await pickDocument(t('pickDocument'));

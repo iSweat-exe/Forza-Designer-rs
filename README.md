@@ -55,6 +55,16 @@ src                React + TypeScript UI (reducers in hooks/, i18n in i18n/)
 The injector talks to the game only through the `ProcessMemory` trait, so the locator and writer are tested against
 an in-memory fake process (fresh templates, decoys, painted templates found by RTTI, corrupted layers, cancel…).
 
+### Performance
+* **Shape search:** shapes are covered by analytic scanline spans, corrected against the exact per-pixel
+  predicate (equivalence-tested), with O(1) transparent-overlap checks. Output is bit-identical to the naive
+  version; single-thread throughput went from 3.9 to ~10 shapes/s on a 1000×900 image
+  (`cargo run --release -p fd-core --example bench -- photo.png 150`).
+* **Memory scan:** every template size is searched in **one** pass over the heap (not one per size), chunks are read
+  by several threads, the RTTI chain is resolved once and skips code pages, colour+mask are written in one call.
+  The scan reaches ~1.2 GiB/s on the in-memory fake process
+  (`cargo test --release -p fd-core scan_throughput -- --ignored --nocapture`).
+
 ### Differences from the Python app
 * The engine fits shapes **fully opaque** (`shape_alpha = 255`) because Forza renders layers opaque, so the preview
   matches the game. The Python app fitted at alpha 128 and forced 255 only at injection time.
@@ -71,7 +81,8 @@ npm run tauri build        # installer (run on Windows for the .exe / NSIS bundl
 
 cargo test --workspace     # core + command tests
 cargo clippy --workspace --all-targets -- -D warnings
-npm test && npm run typecheck
+npm run check              # typecheck + eslint + vitest
+npm run version:check      # Cargo.toml / package.json / tauri.conf.json agree
 
 # headless generation, no UI
 cargo run --release -p fd-core --example generate -- photo.png balanced 1500 out.json
@@ -80,3 +91,12 @@ Linux needs `libwebkit2gtk-4.1-dev libgtk-3-dev` to build the Tauri crate; `fd-c
 
 ## License
 MIT. Contains ideas and bundled quality profiles from Forza Designer 6 — see `LICENSE-ForzaDesigner6`.
+
+## CI/CD
+* `.github/workflows/ci.yml` — on every push/PR: frontend (version check, eslint, tsc, vitest, build), `cargo fmt`,
+  clippy + tests on **Linux and Windows**, a Windows-target type-check of the injection backend, dependency audits
+  (`cargo audit`, `npm audit`), and (on the default branch) a Windows build artifact.
+* `.github/workflows/release.yml` — push a tag `vX.Y.Z` (it must match the version in `Cargo.toml`, `package.json`
+  and `tauri.conf.json`; use `node scripts/version.mjs --set X.Y.Z`). Tests run first, then an NSIS installer
+  (Windows) and AppImage/deb (Linux) are attached to a **draft** GitHub release.
+* Dependabot keeps Cargo, npm and Actions dependencies current (grouped weekly PRs).

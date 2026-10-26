@@ -175,4 +175,63 @@ mod tests {
         doc.save(&path).unwrap();
         assert_eq!(Document::load(&path).unwrap(), doc);
     }
+
+    #[test]
+    fn rejects_an_unsupported_version() {
+        let json = r#"{"format":"fd6.shapes","version":2,"shapes":[]}"#;
+        let err = Document::from_json(json).unwrap_err().to_string();
+        assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_shape_types_with_a_useful_message() {
+        let json = r#"{"format":"fd6.shapes","version":1,"shapes":[{"type":"triangle","x1":0}]}"#;
+        let err = Document::from_json(json).unwrap_err().to_string();
+        assert!(err.contains("triangle"), "{err}");
+    }
+
+    #[test]
+    fn accepts_a_utf8_bom_and_missing_optional_fields() {
+        let json = "\u{feff}{\"format\":\"fd6.shapes\",\"version\":1,\"shapes\":[]}";
+        let doc = Document::from_json(json).unwrap();
+        assert_eq!(
+            (doc.shape_count, doc.image_size, doc.sticker_mode),
+            (0, [0, 0], false)
+        );
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_and_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        let doc = Document::new("a.png", [1, 1], &[], "fast", false);
+        doc.save(&path).unwrap();
+        doc.save(&path).unwrap(); // overwrite
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("out.json")]);
+    }
+
+    #[test]
+    fn geometry_is_rounded_to_three_decimals_on_export() {
+        let s = Shape::Circle {
+            x: 1.234_567,
+            y: 2.0,
+            r: 3.0,
+            color: [0; 4],
+        };
+        let doc = Document::new("a.png", [4, 4], &[s], "fast", false);
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains("1.235"), "{json}");
+    }
+
+    #[test]
+    fn loading_a_missing_file_names_the_path() {
+        let err = Document::load(Path::new("/no/such/file.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file.json"), "{err}");
+    }
 }

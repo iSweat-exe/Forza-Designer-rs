@@ -196,3 +196,79 @@ mod tests {
         assert_eq!(a, b);
     }
 }
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_degenerate_profiles() {
+        let ok = Profile::default();
+        assert!(ok.validate().is_ok());
+        assert!(Profile {
+            stop_at: 0,
+            ..ok.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(Profile {
+            max_resolution: 8,
+            ..ok.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(Profile {
+            shape_types: vec![],
+            ..ok
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_shape_type_is_an_error_and_unknown_keys_are_ignored() {
+        assert!(Profile::from_ini("x", "shapeTypes = hexagon").is_err());
+        let p = Profile::from_ini(
+            "x",
+            "posterizeLevels = 64\ncomputeBackend = gpu\nstopAt = 7",
+        )
+        .unwrap();
+        assert_eq!(p.stop_at, 7);
+    }
+
+    #[test]
+    fn parses_multiple_shape_types_and_save_points() {
+        let p = Profile::from_ini(
+            "x",
+            "shapeTypes = circle, rotated_rectangle\nsaveAt = 10, 20,\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.shape_types,
+            vec![ShapeKind::Circle, ShapeKind::RotatedRectangle]
+        );
+        assert_eq!(p.save_at, vec![10, 20]);
+    }
+
+    #[test]
+    fn comments_and_colons_are_understood() {
+        let p = Profile::from_ini("x", "# note\n; other\nstopAt: 9\n").unwrap();
+        assert_eq!(p.stop_at, 9);
+    }
+
+    #[test]
+    fn profile_round_trips_through_json_for_the_ui() {
+        let p = Profile::default();
+        let back: Profile = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn json_with_missing_fields_falls_back_to_defaults() {
+        let p: Profile = serde_json::from_str(r#"{"stop_at": 5}"#).unwrap();
+        assert_eq!(
+            (p.stop_at, p.random_samples),
+            (5, Profile::default().random_samples)
+        );
+    }
+}

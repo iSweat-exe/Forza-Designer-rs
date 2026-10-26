@@ -11,6 +11,10 @@ use super::shape::{Rgba, Shape};
 /// mouths and outlines.
 const EDGE_BOOST: f32 = 6.0;
 
+/// Gradient magnitudes (0..~1000 scale) below this are float rounding noise on a
+/// flat image; normalising them would turn noise into fake "edges".
+const FLAT_GRADIENT: f32 = 1e-3;
+
 /// A candidate must put at least this share of its body on opaque pixels, or
 /// Forza (no per-pixel alpha) would draw paint into the transparent area.
 const STICKER_OVERLAP_MIN: f32 = 0.995;
@@ -58,7 +62,7 @@ pub fn compute_edge_weight(rgb: &[u8], alpha: &[u8], w: usize, h: usize) -> Vec<
     mag.iter()
         .zip(alpha)
         .map(|(&m, &a)| {
-            let base = if max_mag < 1e-6 {
+            let base = if max_mag < FLAT_GRADIENT {
                 1.0
             } else {
                 1.0 + (EDGE_BOOST - 1.0) * (m / max_mag)
@@ -421,5 +425,138 @@ mod tests {
         let d = composite(&mut shape, &mut s.canvas, &f, &mut Spans::default());
         // Prediction ignores u8 truncation of the committed pixels; allow a hair of slack.
         assert!((predicted - rms(base.0 + d, base.1)).abs() < 0.05);
+    }
+
+    #[test]
+    fn opaque_prefix_counts_alpha_at_or_above_128() {
+        let alpha = [0u8, 127, 128, 255, 255, 0];
+        let p = opaque_prefix(&alpha, 3, 2);
+        assert_eq!(p, vec![0, 0, 0, 1, 0, 1, 2, 2]);
+    }
+
+    #[test]
+    fn flat_image_has_uniform_edge_weight_inside_the_opaque_area() {
+        let rgb = vec![90u8; 8 * 8 * 3];
+        let alpha = vec![255u8; 64];
+        assert!(compute_edge_weight(&rgb, &alpha, 8, 8)
+            .iter()
+            .all(|&w| (w - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn a_hard_edge_gets_the_full_boost() {
+        let mut rgb = vec![0u8; 8 * 8 * 3];
+        for y in 0..8 {
+            for x in 4..8 {
+                rgb[(y * 8 + x) * 3..(y * 8 + x) * 3 + 3].fill(255);
+            }
+        }
+        let w = compute_edge_weight(&rgb, &[255u8; 64], 8, 8);
+        let max = w.iter().cloned().fold(0.0f32, f32::max);
+        assert!((max - EDGE_BOOST).abs() < 1e-4);
+        assert!(
+            (w[0] - 1.0).abs() < 1e-6,
+            "far from the edge stays at baseline"
+        );
+    }
+
+    #[test]
+    fn rms_handles_degenerate_normalisers() {
+        assert_eq!(rms(10.0, 0.0), 0.0);
+        assert_eq!(rms(-5.0, 10.0), 0.0, "tiny negative drift never yields NaN");
+        assert!((rms(100.0, 4.0) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_alpha_fitting_returns_a_black_placeholder_colour() {
+        let s = scene();
+        let f = Fit {
+            shape_alpha: 0,
+            ..fit(&s)
+        };
+        let shape = Shape::Rectangle {
+            x: 12.0,
+            y: 20.0,
+            hw: 4.0,
+            hh: 4.0,
+            color: [9; 4],
+        };
+        let mut spans = Spans::default();
+        assert!(shape.spans(s.w, s.h, &mut spans));
+        assert_eq!(optimal_color(&spans, &s.canvas, &f), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_shape_entirely_in_the_transparent_area_is_rejected() {
+        let s = scene();
+        let f = fit(&s);
+        let base = canvas_error(&s.canvas, &f);
+        let shape = Shape::Circle {
+            x: 1.0,
+            y: 1.0,
+            r: 1.5,
+            color: [0; 4],
+        };
+        assert!(
+            score_shape(&shape, &s.canvas, &f, base, &mut Spans::default())
+                .0
+                .is_infinite()
+        );
+    }
+
+    #[test]
+    fn spans_scoring_matches_a_brute_force_reference() {
+        // Independent per-pixel implementation of the committed error.
+        let mut s = scene();
+        let f_alpha = 200u8;
+        let (w, h) = (s.w, s.h);
+        let (target, alpha, edge, opaque) = (
+            s.target.clone(),
+            s.alpha.clone(),
+            s.edge.clone(),
+            s.opaque.clone(),
+        );
+        let f = Fit {
+            w,
+            h,
+            target: &target,
+            alpha: &alpha,
+            edge: &edge,
+            opaque_prefix: &opaque,
+            shape_alpha: f_alpha,
+        };
+        let base = canvas_error(&s.canvas, &f);
+        let shape = Shape::RotatedEllipse {
+            x: 18.0,
+            y: 22.0,
+            rx: 9.0,
+            ry: 5.0,
+            angle: 70.0,
+            color: [0; 4],
+        };
+        let (predicted, color) = score_shape(&shape, &s.canvas, &f, base, &mut Spans::default());
+
+        let a = f32::from(f_alpha) / 255.0;
+        let mut brute = base.0;
+        for y in 0..h {
+            for x in 0..w {
+                if !shape.contains(x as f32, y as f32) {
+                    continue;
+                }
+                let i = y * w + x;
+                for k in 0..3 {
+                    let (cur, tgt) = (f32::from(s.canvas[i * 3 + k]), f32::from(target[i * 3 + k]));
+                    let m = f32::from(alpha[i]) / 255.0;
+                    let blended = cur + m * a * (f32::from(color[k]) - cur);
+                    brute += f64::from(((blended - tgt).powi(2) - (cur - tgt).powi(2)) * edge[i]);
+                }
+            }
+        }
+        assert!(
+            (predicted - rms(brute, base.1)).abs() < 1e-3,
+            "{predicted} vs {}",
+            rms(brute, base.1)
+        );
+        let _ = &mut s;
     }
 }

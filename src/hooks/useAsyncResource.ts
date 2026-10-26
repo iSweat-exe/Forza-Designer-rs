@@ -9,36 +9,36 @@ interface Resource<T> {
   reload: () => void;
 }
 
-/** Runs `load` on mount and whenever `reload()` is called. Ignores stale results. */
+interface Settled<T> {
+  tick: number;
+  data: T | null;
+  error: string | null;
+}
+
+/**
+ * Runs `load` on mount and whenever `reload()` is called. `load` must be a
+ * stable reference (a module-level function or a memoised callback). Data from
+ * the previous load stays visible while a reload is in flight.
+ */
 export function useAsyncResource<T>(load: () => Promise<T>): Resource<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [settled, setSettled] = useState<Settled<T> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     load()
-      .then((d) => {
-        if (!cancelled) {
-          setData(d);
-          setError(null);
-        }
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setError(errorMessage(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      .then((data) => !cancelled && setSettled({ tick, data, error: null }))
+      .catch((e: unknown) => !cancelled && setSettled((prev) => ({ tick, data: prev?.data ?? null, error: errorMessage(e) })));
     return () => {
       cancelled = true;
     };
-    // `load` is expected to be a stable reference (e.g. a function from `api`).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
+  }, [load, tick]);
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
-  return { data, loading, error, reload };
+  return {
+    data: settled?.data ?? null,
+    error: settled?.error ?? null,
+    loading: settled === null || settled.tick !== tick,
+    reload,
+  };
 }

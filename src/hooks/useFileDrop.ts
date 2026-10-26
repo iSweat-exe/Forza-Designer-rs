@@ -9,7 +9,13 @@ export function useFileDrop(enabled: boolean, onDrop: (path: string) => void): b
     if (!enabled) return;
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    getCurrentWebview()
+    let webview: ReturnType<typeof getCurrentWebview>;
+    try {
+      webview = getCurrentWebview();
+    } catch {
+      return; // not running inside Tauri (tests, plain browser)
+    }
+    webview
       .onDragDropEvent((event) => {
         const p = event.payload;
         if (p.type === 'enter' || p.type === 'over') setHovering(true);

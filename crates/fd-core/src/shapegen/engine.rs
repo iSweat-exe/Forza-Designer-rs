@@ -464,4 +464,100 @@ mod tests {
             .unwrap();
         assert!(message.is_some());
     }
+
+    #[test]
+    fn every_enabled_shape_type_gets_commit_slots() {
+        let mut p = profile(24);
+        p.shape_types = vec![ShapeKind::Circle, ShapeKind::RotatedRectangle];
+        let mut engine = Engine::new(target(), p, 9, Control::default()).unwrap();
+        engine.run(|_| {}).unwrap();
+        let kinds: std::collections::HashSet<_> = engine.shapes().iter().map(Shape::kind).collect();
+        assert_eq!(
+            kinds,
+            [ShapeKind::Circle, ShapeKind::RotatedRectangle]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn translucent_fitting_is_supported_and_keeps_the_alpha() {
+        let mut p = profile(10);
+        p.shape_alpha = 128;
+        let mut engine = Engine::new(target(), p, 4, Control::default()).unwrap();
+        let start = engine.rms();
+        engine.run(|_| {}).unwrap();
+        assert!(engine.rms() < start);
+        assert!(engine.shapes().iter().all(|s| s.color()[3] == 128));
+    }
+
+    #[test]
+    fn no_shape_ever_paints_into_the_transparent_ring() {
+        let t = target();
+        let mut engine = Engine::new(t.clone(), profile(25), 21, Control::default()).unwrap();
+        engine.run(|_| {}).unwrap();
+        let (w, h) = engine.size();
+        let painted = crate::shapegen::render_shapes(engine.shapes(), w, h, None);
+        for (i, px) in painted.chunks_exact(4).enumerate() {
+            if t.alpha[i] == 0 {
+                assert_eq!(px[3], 0, "pixel {i} outside the opaque area was painted");
+            }
+        }
+    }
+
+    #[test]
+    fn paused_run_makes_no_progress_until_resumed() {
+        let control = Control::default();
+        control.set_paused(true);
+        let mut engine = Engine::new(target(), profile(3), 2, control.clone()).unwrap();
+        let resumer = control.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            resumer.set_paused(false);
+        });
+        let started = std::time::Instant::now();
+        engine.run(|_| {}).unwrap();
+        handle.join().unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        assert_eq!(engine.shapes().len(), 3);
+    }
+
+    #[test]
+    fn rejects_an_empty_image_and_a_bad_profile() {
+        let empty = Target {
+            width: 0,
+            height: 0,
+            rgb: vec![],
+            alpha: vec![],
+        };
+        assert!(Engine::new(empty, profile(3), 1, Control::default()).is_err());
+        assert!(Engine::new(
+            target(),
+            Profile {
+                stop_at: 0,
+                ..profile(1)
+            },
+            1,
+            Control::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn worker_count_is_capped_by_requests_and_workload() {
+        assert_eq!(worker_count(1, 100_000), 1);
+        let auto = worker_count(0, 100_000);
+        assert!(auto >= 1);
+        assert_eq!(
+            worker_count(usize::MAX, 100_000),
+            auto,
+            "an explicit request is still capped by the CPU budget"
+        );
+        assert_eq!(
+            worker_count(8, 64),
+            1,
+            "tiny budgets are not worth extra threads"
+        );
+        assert!(worker_count(0, 1_000_000) >= 1);
+    }
 }

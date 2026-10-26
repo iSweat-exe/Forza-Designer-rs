@@ -53,3 +53,59 @@ impl Jobs {
         lock(&self.injection).clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    #[test]
+    fn only_one_generation_at_a_time() {
+        let jobs = Jobs::default();
+        assert!(jobs.begin_generation().is_some());
+        assert!(jobs.begin_generation().is_none());
+        jobs.end_generation();
+        assert!(jobs.begin_generation().is_some());
+    }
+
+    #[test]
+    fn stop_reaches_the_running_generation() {
+        let jobs = Jobs::default();
+        let control = jobs.begin_generation().unwrap();
+        jobs.generation().unwrap().request_stop();
+        assert!(control.is_stopped());
+    }
+
+    #[test]
+    fn no_generation_to_control_when_idle() {
+        assert!(Jobs::default().generation().is_none());
+    }
+
+    #[test]
+    fn only_one_injection_at_a_time_and_cancel_is_shared() {
+        let jobs = Jobs::default();
+        let flag = jobs.begin_injection().unwrap();
+        assert!(jobs.begin_injection().is_none());
+        jobs.injection().unwrap().store(true, Ordering::Relaxed);
+        assert!(flag.load(Ordering::Relaxed));
+        jobs.end_injection();
+        assert!(jobs.injection().is_none());
+        assert!(
+            !jobs.begin_injection().unwrap().load(Ordering::Relaxed),
+            "fresh flag per job"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_wedge_the_app() {
+        let jobs = std::sync::Arc::new(Jobs::default());
+        let j = jobs.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = j.generation.lock().unwrap();
+            panic!("boom");
+        })
+        .join();
+        assert!(jobs.begin_generation().is_some());
+    }
+}
