@@ -19,7 +19,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_Debug",
